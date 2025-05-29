@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="ru" class="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Чат с Gemini</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script type="module">
+        // Импорт Firebase
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            setDoc, 
+            getDoc,
+            onSnapshot,
+            serverTimestamp,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Конфигурация Firebase и ID приложения
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "YOUR_API_KEY", authDomain: "YOUR_AUTH_DOMAIN", projectId: "YOUR_PROJECT_ID" };
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'gemini-chat-advanced-app';
+        
+        // Инициализация Firebase
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        setLogLevel('debug');
+
+        let userId = null;
+        let currentModel = 'gemini-2.0-flash'; // Модель по умолчанию
+        const GEMINI_API_KEY = ""; // API ключ для Gemini (предоставляется Canvas)
+
+        // --- Элементы DOM ---
+        const loginScreen = document.getElementById('loginScreen');
+        const mainAppScreen = document.getElementById('mainAppScreen');
+        const passwordInput = document.getElementById('passwordInput');
+        const loginButton = document.getElementById('loginButton');
+        const chatMessagesContainer = document.getElementById('chatMessages');
+        const messageInput = document.getElementById('messageInput');
+        const sendButton = document.getElementById('sendButton');
+        const settingsPanel = document.getElementById('settingsPanel');
+        const settingsButton = document.getElementById('settingsButton');
+        const closeSettingsButton = document.getElementById('closeSettingsButton');
+        const themeToggle = document.getElementById('themeToggle');
+        const modelSelector = document.getElementById('modelSelector');
+        const clearChatButton = document.getElementById('clearChatButton');
+        const userIdDisplay = document.getElementById('userIdDisplay');
+        const appLoadingIndicator = document.getElementById('appLoadingIndicator');
+        const typingIndicator = document.getElementById('typingIndicator');
+        const loginError = document.getElementById('loginError'); // Элемент для отображения ошибки входа
+
+        const CORRECT_PASSWORD = "2914"; // Измененный код доступа
+
+        // --- Модели Gemini ---
+        const geminiModels = [
+            { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash (Быстрый)' },
+            { id: 'gemini-pro', name: 'Gemini Pro (Стандартный)' }
+            // Добавьте другие модели при необходимости
+        ];
+
+        // --- Логика входа ---
+        function handleLogin() {
+            loginError.classList.add('hidden'); // Скрываем предыдущую ошибку
+            if (passwordInput.value === CORRECT_PASSWORD) {
+                loginScreen.classList.add('opacity-0', 'pointer-events-none');
+                // Небольшая задержка перед скрытием экрана входа, чтобы анимация успела сработать
+                setTimeout(() => {
+                    loginScreen.classList.add('hidden'); 
+                }, 500); // Соответствует duration-500
+                mainAppScreen.classList.remove('hidden');
+                setTimeout(() => {
+                    mainAppScreen.classList.remove('opacity-0', 'pointer-events-none');
+                }, 50); // Небольшая задержка для плавного появления
+                
+                passwordInput.value = '';
+                initializeMainApp();
+            } else {
+                loginError.textContent = 'Неверный код доступа. Попробуйте еще раз.';
+                loginError.classList.remove('hidden');
+                passwordInput.value = '';
+                passwordInput.focus();
+            }
+        }
+
+        // --- Инициализация основного приложения ---
+        async function initializeMainApp() {
+            appLoadingIndicator.classList.remove('hidden');
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    userIdDisplay.textContent = `User ID: ${userId}`;
+                    console.log("Пользователь аутентифицирован:", userId);
+                    populateModelSelector();
+                    await loadChatHistory();
+                    setupEventListeners(); // Перемещен вызов сюда, чтобы обработчики назначались после аутентификации
+                    applyTheme(localStorage.getItem('theme') || 'light'); 
+                } else {
+                    console.log("Пользователь не аутентифицирован, попытка входа...");
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                        // onAuthStateChanged сработает снова
+                    } catch (error) {
+                        console.error("Ошибка аутентификации:", error);
+                        appLoadingIndicator.innerHTML = `<p class="text-red-500">Ошибка аутентификации. Обновите страницу.</p>`;
+                    }
+                }
+                appLoadingIndicator.classList.add('hidden');
+            });
+        }
+        
+        function populateModelSelector() {
+            modelSelector.innerHTML = '';
+            geminiModels.forEach(model => {
+                const option = document.createElement('option');
+                option.value = model.id;
+                option.textContent = model.name;
+                if (model.id === currentModel) {
+                    option.selected = true;
+                }
+                modelSelector.appendChild(option);
+            });
+        }
+
+        // --- Настройки ---
+        function toggleSettingsPanel() {
+            settingsPanel.classList.toggle('translate-x-full');
+        }
+
+        function applyTheme(theme) {
+            if (theme === 'dark') {
+                document.documentElement.classList.add('dark');
+                themeToggle.checked = true;
+            } else {
+                document.documentElement.classList.remove('dark');
+                themeToggle.checked = false;
+            }
+            localStorage.setItem('theme', theme);
+        }
+
+        // --- Логика чата ---
+        function sanitizeModelNameForFirestore(modelName) {
+            return modelName.replace(/[^a-zA-Z0-9_-]/g, '_');
+        }
+
+        async function loadChatHistory() {
+            if (!userId) return;
+            chatMessagesContainer.innerHTML = ''; // Очищаем перед загрузкой
+            const safeModelName = sanitizeModelNameForFirestore(currentModel);
+            const chatDocRef = doc(db, `artifacts/${appId}/users/${userId}/gemini_model_chats/${safeModelName}`);
+            
+            try {
+                // Используем onSnapshot для обновлений в реальном времени
+                onSnapshot(chatDocRef, (docSnap) => {
+                    chatMessagesContainer.innerHTML = ''; // Очищаем при каждом обновлении
+                    if (docSnap.exists()) {
+                        const data = docSnap.data();
+                        if (data.messages && Array.isArray(data.messages)) {
+                            data.messages.forEach(msg => addMessageToUI(msg.role, msg.text, false));
+                        }
+                    } else {
+                        console.log(`Нет истории для модели ${currentModel}`);
+                         addMessageToUI("system", `История чата для модели ${currentModel} пуста. Начните диалог!`, false);
+                    }
+                    scrollToBottom();
+                });
+            } catch (error) {
+                console.error("Ошибка загрузки истории чата:", error);
+                addMessageToUI("system", "Ошибка загрузки истории чата.", false);
+            }
+        }
+
+        async function saveChatHistory(role, text) {
+            if (!userId) return;
+            const safeModelName = sanitizeModelNameForFirestore(currentModel);
+            const chatDocRef = doc(db, `artifacts/${appId}/users/${userId}/gemini_model_chats/${safeModelName}`);
+            const newMessage = { role, text, timestamp: serverTimestamp() };
+
+            try {
+                const docSnap = await getDoc(chatDocRef);
+                let messages = [];
+                if (docSnap.exists() && docSnap.data().messages && Array.isArray(docSnap.data().messages)) {
+                    messages = docSnap.data().messages;
+                }
+                messages.push(newMessage);
+                await setDoc(chatDocRef, { messages }, { merge: true }); // Используем merge: true для безопасности
+            } catch (error) {
+                console.error("Ошибка сохранения истории чата:", error);
+            }
+        }
+        
+        async function clearChatHistory() {
+            if (!userId) return;
+            // Замена confirm на кастомный модал (пока оставим простой confirm для краткости)
+            if (!window.confirm("Вы уверены, что хотите очистить историю чата для этой модели? Это действие необратимо.")) { 
+                return;
+            }
+            const safeModelName = sanitizeModelNameForFirestore(currentModel);
+            const chatDocRef = doc(db, `artifacts/${appId}/users/${userId}/gemini_model_chats/${safeModelName}`);
+            try {
+                await setDoc(chatDocRef, { messages: [] }); 
+                // chatMessagesContainer.innerHTML = ''; // onSnapshot должен обновить UI
+                addMessageToUI("system", "История чата очищена.", false); // Это сообщение может быть перезаписано onSnapshot
+                console.log(`История чата для модели ${currentModel} очищена.`);
+            } catch (error) {
+                console.error("Ошибка очистки истории чата:", error);
+                addMessageToUI("system", "Не удалось очистить историю чата.", false);
+            }
+        }
+
+
+        function addMessageToUI(role, text, animate = true) {
+            const messageElement = document.createElement('div');
+            messageElement.classList.add('p-3', 'rounded-xl', 'max-w-[80%]', 'mb-3', 'shadow-md', 'break-words');
+            if (animate) {
+                 messageElement.classList.add('opacity-0', 'translate-y-2');
+                 // Запускаем анимацию после добавления в DOM
+                 requestAnimationFrame(() => {
+                    requestAnimationFrame(() => { // Двойной requestAnimationFrame для надежности срабатывания transition
+                        messageElement.classList.add('transition-all', 'duration-500', 'ease-out');
+                        messageElement.classList.remove('opacity-0', 'translate-y-2');
+                    });
+                 });
+            }
+
+
+            if (role === 'user') {
+                messageElement.classList.add('bg-indigo-500', 'text-white', 'self-end', 'rounded-br-none');
+            } else if (role === 'model') {
+                messageElement.classList.add('bg-gray-200', 'dark:bg-gray-700', 'text-gray-800', 'dark:text-gray-200', 'self-start', 'rounded-bl-none');
+            } else { // system message
+                messageElement.classList.add('bg-yellow-100', 'dark:bg-yellow-700', 'text-yellow-800', 'dark:text-yellow-200', 'self-center', 'text-sm', 'italic', 'text-center');
+            }
+            
+            let formattedText = text.replace(/\n/g, '<br>');
+            formattedText = formattedText.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>'); 
+            formattedText = formattedText.replace(/\*(.*?)\*/g, '<em>$1</em>');       
+
+            messageElement.innerHTML = formattedText;
+            chatMessagesContainer.appendChild(messageElement);
+
+            scrollToBottom();
+        }
+
+        function scrollToBottom() {
+            chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
+        }
+
+        async function handleSendMessage() {
+            const messageText = messageInput.value.trim();
+            if (messageText === '' || !userId) return;
+
+            addMessageToUI('user', messageText);
+            await saveChatHistory('user', messageText); // Сохраняем сообщение пользователя сразу
+            messageInput.value = '';
+            sendButton.disabled = true;
+            typingIndicator.classList.remove('hidden');
+
+            let conversationHistory = [];
+            const safeModelName = sanitizeModelNameForFirestore(currentModel);
+            const chatDocRef = doc(db, `artifacts/${appId}/users/${userId}/gemini_model_chats/${safeModelName}`);
+            try {
+                const docSnap = await getDoc(chatDocRef);
+                if (docSnap.exists() && docSnap.data().messages) {
+                    const allMessages = docSnap.data().messages;
+                    // Берем последние N сообщений для контекста (N-1, т.к. последнее сообщение пользователя уже добавлено)
+                    // Gemini API ожидает, что последнее сообщение в history будет от 'model', если это продолжение диалога,
+                    // или history может быть пустой, если это начало.
+                    // Мы будем передавать всю историю до текущего сообщения пользователя.
+                    const historyForPrompt = allMessages.slice(0, -1).slice(-10); // Последние 10 сообщений ДО текущего user message
+                    conversationHistory = historyForPrompt.map(msg => ({
+                        role: msg.role,
+                        parts: [{ text: msg.text }]
+                    }));
+                }
+            } catch (e) { console.error("Ошибка получения истории для контекста:", e); }
+            
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${GEMINI_API_KEY}`;
+            const payload = {
+                contents: [...conversationHistory, { role: "user", parts: [{ text: messageText }] }], // Добавляем текущее сообщение пользователя
+            };
+            
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    console.error("Ошибка Gemini API:", errorData);
+                    throw new Error(`Ошибка API: ${response.statusText} - ${errorData.error?.message || 'Нет деталей'}`);
+                }
+
+                const result = await response.json();
+                if (result.candidates && result.candidates.length > 0 &&
+                    result.candidates[0].content && result.candidates[0].content.parts &&
+                    result.candidates[0].content.parts.length > 0) {
+                    const modelResponse = result.candidates[0].content.parts[0].text;
+                    addMessageToUI('model', modelResponse);
+                    await saveChatHistory('model', modelResponse);
+                } else {
+                    let errorMessage = 'Не удалось получить ответ от ИИ.';
+                    if (result.promptFeedback && result.promptFeedback.blockReason) {
+                        errorMessage += ` Причина блокировки: ${result.promptFeedback.blockReason}.`;
+                         if (result.promptFeedback.blockReason === "SAFETY" && result.promptFeedback.safetyRatings) {
+                            errorMessage += " Рейтинги безопасности: " + result.promptFeedback.safetyRatings.map(r => `${r.category}: ${r.probability}`).join(', ');
+                        }
+                    } else {
+                         errorMessage += ' Структура ответа неверна.';
+                    }
+                    console.error("Неожиданная структура ответа или блокировка Gemini API:", result);
+                    addMessageToUI('system', errorMessage);
+                    // Не сохраняем системное сообщение об ошибке в историю чата
+                }
+            } catch (error) {
+                console.error("Ошибка при вызове Gemini API:", error);
+                addMessageToUI('system', `Ошибка: ${error.message}`);
+            } finally {
+                sendButton.disabled = false;
+                typingIndicator.classList.add('hidden');
+                scrollToBottom();
+            }
+        }
+        
+        // --- Обработчики событий ---
+        function setupEventListeners() {
+            // Эти обработчики должны назначаться один раз
+            if (loginButton.dataset.listenerAttached) return; // Предотвращаем повторное назначение
+
+            loginButton.addEventListener('click', handleLogin);
+            passwordInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') handleLogin();
+            });
+            loginButton.dataset.listenerAttached = 'true';
+
+
+            sendButton.addEventListener('click', handleSendMessage);
+            messageInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSendMessage();
+                }
+            });
+            messageInput.addEventListener('input', () => {
+                sendButton.disabled = messageInput.value.trim() === '';
+            });
+
+
+            settingsButton.addEventListener('click', toggleSettingsPanel);
+            closeSettingsButton.addEventListener('click', toggleSettingsPanel);
+
+            themeToggle.addEventListener('change', (e) => {
+                applyTheme(e.target.checked ? 'dark' : 'light');
+            });
+
+            modelSelector.addEventListener('change', async (e) => {
+                currentModel = e.target.value;
+                console.log("Модель изменена на:", currentModel);
+                // onSnapshot должен автоматически обновить историю, но можно добавить индикатор
+                chatMessagesContainer.innerHTML = `<p class="text-center text-gray-500 dark:text-gray-400 p-4">Загрузка истории для модели ${currentModel}...</p>`;
+                // loadChatHistory() вызывается через onSnapshot, поэтому явный вызов здесь не нужен,
+                // но onSnapshot сработает только если документ уже существует.
+                // Если документа нет, нужно его создать или обработать этот случай.
+                // Для простоты, onSnapshot должен справиться или показать "Нет истории".
+                // Чтобы принудительно обновить, если onSnapshot уже активен, можно сделать фиктивное чтение,
+                // но лучше полагаться на то, что onSnapshot сам отреагирует на изменение currentModel при следующем чтении.
+                // В данном случае, loadChatHistory() и так вызывается при смене модели, что корректно.
+                await loadChatHistory(); 
+            });
+            
+            clearChatButton.addEventListener('click', clearChatHistory);
+        }
+        
+        // Инициализация при загрузке страницы (показываем экран входа)
+        // setupEventListeners() вызывается в initializeMainApp после аутентификации
+        // чтобы гарантировать, что userId доступен для обработчиков, если это необходимо.
+        // Однако, для loginButton и passwordInput это не обязательно, их можно назначить сразу.
+        // Решил перенести setupEventListeners() внутрь initializeMainApp для консистентности.
+        // Но для кнопок входа это можно сделать и вне onAuthStateChanged.
+        // Для простоты оставим так, но учтем, что login-специфичные обработчики можно вынести.
+        
+        // Назначим обработчики для экрана входа сразу
+        loginButton.addEventListener('click', handleLogin);
+        passwordInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') handleLogin();
+        });
+
+
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        #chatMessages {
+            scroll-behavior: smooth;
+        }
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1; /* gray-300 */
+            border-radius: 10px;
+        }
+        .dark ::-webkit-scrollbar-thumb {
+            background: #4b5563; /* gray-600 */
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #9ca3af; /* gray-400 */
+        }
+        .dark ::-webkit-scrollbar-thumb:hover {
+            background: #6b7280; /* gray-500 */
+        }
+        .typing-dot {
+            animation: typing-blink 1.4s infinite both;
+        }
+        .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes typing-blink {
+            0% { opacity: 0.2; }
+            20% { opacity: 1; }
+            100% { opacity: 0.2; }
+        }
+        /* Плавное появление основного экрана */
+        #mainAppScreen.opacity-0 {
+            opacity: 0;
+        }
+        #mainAppScreen {
+            transition: opacity 0.5s ease-in-out;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100 transition-colors duration-300 overflow-hidden h-screen">
+
+    <div id="loginScreen" class="fixed inset-0 bg-gradient-to-br from-indigo-600 to-purple-700 flex flex-col items-center justify-center p-4 transition-opacity duration-500 ease-in-out z-50">
+        <div class="bg-white dark:bg-gray-800 p-8 rounded-xl shadow-2xl w-full max-w-md text-center">
+            <h1 class="text-3xl font-bold text-indigo-600 dark:text-indigo-400 mb-2">Добро пожаловать!</h1>
+            <p class="text-gray-600 dark:text-gray-300 mb-6">Введите код доступа для входа в Gemini Чат.</p>
+            <input type="password" id="passwordInput" placeholder="Код доступа" class="w-full p-3 mb-4 border border-gray-300 dark:border-gray-600 rounded-lg bg-gray-50 dark:bg-gray-700 focus:ring-2 focus:ring-indigo-500 outline-none transition-all">
+            <p id="loginError" class="text-red-500 text-sm mb-4 hidden"></p> <button id="loginButton" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-4 rounded-lg transition-colors duration-300 shadow-md hover:shadow-lg">
+                Войти
+            </button>
+        </div>
+        </div>
+
+    <div id="mainAppScreen" class="h-screen flex flex-col opacity-0 pointer-events-none hidden transition-opacity duration-500 ease-in-out">
+        <header class="bg-white dark:bg-gray-800 shadow-md p-4 flex justify-between items-center shrink-0">
+            <h1 class="text-xl sm:text-2xl font-bold text-indigo-600 dark:text-indigo-400">Gemini Чат</h1>
+            <div class="flex items-center space-x-2">
+                <span id="userIdDisplay" class="text-xs text-gray-500 dark:text-gray-400 hidden sm:block"></span>
+                <button id="settingsButton" title="Настройки" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-gray-600 dark:text-gray-300"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                </button>
+            </div>
+        </header>
+
+        <main class="flex-grow overflow-y-auto p-4 sm:p-6 space-y-4">
+            <div id="appLoadingIndicator" class="text-center py-10 hidden">
+                <svg class="animate-spin h-8 w-8 text-indigo-500 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <p class="mt-2 text-gray-500 dark:text-gray-400">Загрузка приложения...</p>
+            </div>
+            <div id="chatMessages" class="flex flex-col space-y-2">
+                </div>
+             <div id="typingIndicator" class="hidden flex items-center space-x-1 p-3 self-start">
+                <div class="w-2 h-2 bg-indigo-500 rounded-full typing-dot"></div>
+                <div class="w-2 h-2 bg-indigo-500 rounded-full typing-dot"></div>
+                <div class="w-2 h-2 bg-indigo-500 rounded-full typing-dot"></div>
+                <span class="text-sm text-gray-500 dark:text-gray-400 ml-1">Gemini печатает...</span>
+            </div>
+        </main>
+
+        <footer class="bg-white dark:bg-gray-800 p-4 border-t border-gray-200 dark:border-gray-700 shrink-0">
+            <div class="flex items-center space-x-3 max-w-3xl mx-auto">
+                <textarea id="messageInput" rows="1" placeholder="Введите ваше сообщение..." class="flex-grow p-3 border border-gray-300 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-700 focus:ring-2 focus:ring-indigo-500 outline-none resize-none transition-all text-sm sm:text-base" style="min-height: 48px; max-height: 150px;"></textarea>
+                <button id="sendButton" title="Отправить" class="p-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl transition-colors duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0" disabled>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                </button>
+            </div>
+        </footer>
+    </div>
+
+    <aside id="settingsPanel" class="fixed inset-y-0 right-0 w-full sm:w-80 bg-white dark:bg-gray-800 shadow-xl p-6 transform translate-x-full transition-transform duration-300 ease-in-out z-40 flex flex-col">
+        <div class="flex justify-between items-center mb-6">
+            <h2 class="text-xl font-semibold text-gray-700 dark:text-gray-200">Настройки</h2>
+            <button id="closeSettingsButton" title="Закрыть настройки" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors">
+                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-gray-600 dark:text-gray-300"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+        </div>
+        
+        <div class="space-y-6 flex-grow overflow-y-auto">
+            <div>
+                <label for="themeToggle" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Темная тема</label>
+                <label class="relative inline-flex items-center cursor-pointer">
+                    <input type="checkbox" id="themeToggle" class="sr-only peer">
+                    <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-300 dark:peer-focus:ring-indigo-800 rounded-full peer dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-indigo-600"></div>
+                </label>
+            </div>
+
+            <div>
+                <label for="modelSelector" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Выбрать модель ИИ</label>
+                <select id="modelSelector" class="w-full p-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-gray-50 dark:bg-gray-700 focus:ring-2 focus:ring-indigo-500 outline-none transition-all">
+                    </select>
+            </div>
+            
+            <div>
+                <button id="clearChatButton" class="w-full bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg transition-colors duration-300 shadow-sm hover:shadow-md">
+                    Очистить историю чата
+                </button>
+            </div>
+        </div>
+        <div class="mt-auto pt-6 border-t border-gray-200 dark:border-gray-700 text-center">
+            <p class="text-xs text-gray-500 dark:text-gray-400">Gemini Чат v1.1</p> </div>
+    </aside>
+    <script>
+        // Динамическая настройка высоты textarea
+        const textarea = document.getElementById('messageInput');
+        if (textarea) { // Добавлена проверка на существование элемента
+            textarea.addEventListener('input', () => {
+                textarea.style.height = 'auto'; 
+                textarea.style.height = `${Math.min(textarea.scrollHeight, 150)}px`; 
+            });
+        }
+    </script>
+</body>
+</html>
